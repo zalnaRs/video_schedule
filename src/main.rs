@@ -1,94 +1,104 @@
-use std::fs::File;
-use std::io::{BufReader, Write, BufRead};
-use chrono::{NaiveTime, Timelike};
-use serde::Deserialize;
-use tokio::time::{sleep, Duration};
-#[cfg(target_os = "linux")]
-use std::os::unix::net::UnixStream;
-#[cfg(target_os = "windows")]
-use tokio::net::windows::named_pipe::{NamedPipeClient};
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::time::sleep;
+use std::io::{Write, Read};
+use std::os::windows::io::AsRawHandle;
+use winapi::um::namedpipeapi::CreateFileA;
+use winapi::um::fileapi::FILE_GENERIC_WRITE;
+use winapi::um::winnt::{FILE_ATTRIBUTE_NORMAL, GENERIC_WRITE};
+use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 
-#[derive(Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct VideoTask {
     delay: String,
     file_path: String,
-    start_time: String,
+    start_time: u64,
 }
 
-async fn send_command(socket_path: &str, command: &str) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut stream = UnixStream::connect(socket_path)?;
-        stream.write_all(command.as_bytes())?;
-        stream.write_all(b"\n")?;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Use NamedPipeClient::connect to connect to an existing named pipe
-        let mut pipe = NamedPipeClient::connect(socket_path).await?;  // Connect to the named pipe
-        pipe.write_all(command.as_bytes()).await?;
-        pipe.write_all(b"\n").await?;
-    }
-
-    Ok(())
+// Parse the JSON schedule
+async fn parse_schedule(file_path: &str) -> anyhow::Result<Vec<VideoTask>> {
+    let file_content = fs::read_to_string(file_path)?;
+    let schedule: Vec<VideoTask> = serde_json::from_str(&file_content)?;
+    Ok(schedule)
 }
 
-async fn wait_for_event(socket_path: &str, event: &str) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "linux")]
-    {
-        let stream = UnixStream::connect(socket_path)?;
-        let reader = BufReader::new(stream);
-        for line in reader.lines() {
-            let line = line?;
-            if line.contains(event) {
-                break;
-            }
-        }
-    }
+// Send a command to MPV via a named pipe
+fn send_command(pipe_name: &str, command: &str) -> anyhow::Result<()> {
+    unsafe {
+        let pipe_handle = CreateFileA(
+            pipe_name.as_ptr() as *const i8,
+            GENERIC_WRITE,
+            0,
+            std::ptr::null_mut(),
+            3, // OPEN_EXISTING
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
 
-    #[cfg(target_os = "windows")]
-    {
-        // Connect to the named pipe
-        let mut pipe = NamedPipeClient::from_raw_handle(socket_path).await?;  // Connect to the named pipe
-        let reader = BufReader::new(pipe);
-        let mut lines = reader.lines();
-        while let Some(line) = lines.next_line().await? {
-            if line.contains(event) {
-                break;
-            }
+        if pipe_handle == INVALID_HANDLE_VALUE {
+            return Err(anyhow::anyhow!("Failed to open named pipe"));
         }
-    }
 
-    Ok(())
+        let mut pipe = std::fs::File::from_raw_handle(pipe_handle as *mut _);
+        pipe.write_all(command.as_bytes())?;
+        pipe.write_all(b"\n")?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ipc_socket_file = File::open("socket.txt")?;
-    let binding = BufReader::new(ipc_socket_file).lines().next().unwrap()?;
-    let ipc_socket = binding.as_str();
+async fn main() -> anyhow::Result<()> {
+    // Path to MPV executable and named pipe
+    let mpv_executable = "./mpv_dir/mpv.exe";
+    let ipc_pipe_name = r"\\.\pipe\mpv_ipc";
 
-    let file = File::open("schedule.json")?;
-    let reader = BufReader::new(file);
-    let schedule: Vec<VideoTask> = serde_json::from_reader(reader)?;
+    // Start MPV with named pipe
+    let mut mpv_process = Command::new(mpv_executable)
+        .args(["--idle", "--input-ipc-server", ipc_pipe_name])
+        .spawn()?;
 
-    for task in &schedule {
-        let task_time = NaiveTime::parse_from_str(&task.delay, "%H:%M:%S")?;
-        let total_delay_seconds = task_time.hour() * 3600 + task_time.minute() * 60 + task_time.second();
-        if total_delay_seconds > 0 {
-            sleep(Duration::from_secs(total_delay_seconds as u64)).await;
+    let schedule = parse_schedule("schedule.json").await?;
+
+    for task in schedule {
+        // Parse the delay
+        let delay_parts: Vec<u64> = task
+            .delay
+            .split(':')
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect();
+
+        let delay_duration = Duration::from_secs(
+            delay_parts[0] * 3600 + delay_parts[1] * 60 + delay_parts[2],
+        );
+
+        if delay_duration > Duration::from_secs(0) {
+            sleep(delay_duration).await;
         }
 
         println!("Playing: {} at {} seconds", task.file_path, task.start_time);
 
-        send_command(ipc_socket, &format!("{{\"command\": [\"loadfile\", \"{}\"]}}", task.file_path)).await?;
-        wait_for_event(ipc_socket, "file-loaded").await?;
-        send_command(ipc_socket, &format!("{{\"command\": [\"seek\", \"{}\", \"absolute\"]}}", task.start_time)).await?;
+        // Send loadfile command
+        let loadfile_command = format!(
+            "{{\"command\":[\"loadfile\",\"{}\"]}}",
+            task.file_path.replace("\\", "/")
+        );
+        send_command(ipc_pipe_name, &loadfile_command)?;
 
+        // Send seek command
+        let seek_command = format!(
+            "{{\"command\":[\"seek\",{},\"absolute\"]}}",
+            task.start_time
+        );
+        send_command(ipc_pipe_name, &seek_command)?;
+
+        // Small delay to ensure commands are processed
         sleep(Duration::from_secs(1)).await;
     }
+
+    // Wait for MPV process to exit
+    mpv_process.wait().await?;
 
     Ok(())
 }
