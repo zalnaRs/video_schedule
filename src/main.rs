@@ -13,20 +13,38 @@ struct VideoTask {
 }
 
 fn send_command(socket_path: &str, command: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.write_all(command.as_bytes())?;
-    stream.write_all(b"\n")?;
+    if cfg!(target_os = "windows") {
+        let mut stream = File::create(socket_path)?;
+        stream.write_all(command.as_bytes())?;
+        stream.write_all(b"\n")?;
+    } else if !cfg!(target_os = "linux") {
+        let mut stream = UnixStream::connect(socket_path)?;
+        stream.write_all(command.as_bytes())?;
+        stream.write_all(b"\n")?;
+    }
     Ok(())
 }
 
 fn wait_for_event(socket_path: &str, event: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = UnixStream::connect(socket_path)?;
-    let reader = BufReader::new(stream);
+    if cfg!(target_os = "windows") {
+        let mut stream = File::open(socket_path)?;
+        let reader = BufReader::new(stream);
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.contains(event) {
-            break;
+        for line in reader.lines() {
+            let line = line?;
+            if line.contains(event) {
+                break;
+            }
+        }
+    } else if !cfg!(target_os = "linux") {
+        let stream = UnixStream::connect(socket_path)?;
+        let reader = BufReader::new(stream);
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.contains(event) {
+                break;
+            }
         }
     }
     Ok(())
@@ -34,7 +52,8 @@ fn wait_for_event(socket_path: &str, event: &str) -> Result<(), Box<dyn std::err
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ipc_socket = "/home/user/mpvsocket";
+    let ipc_socket_file = File::open("socket.txt")?;
+    let ipc_socket = BufReader::new(ipc_socket_file).lines().next().unwrap()?.as_str();
 
     let file = File::open("schedule.json")?;
     let reader = BufReader::new(file);
